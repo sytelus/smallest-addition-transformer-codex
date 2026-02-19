@@ -1,0 +1,11 @@
+{
+  "run_name": "search_l1_d8_ff12",
+  "params": 1644,
+  "best_val_exact": 0.9935,
+  "best_step": 4999,
+  "train_steps": 5000,
+  "elapsed_sec": 95.42145586013794,
+  "metrics_csv": "artifacts/search_l1_d8_ff12/metrics.csv",
+  "best_ckpt": "artifacts/search_l1_d8_ff12/checkpoints/best.pt",
+  "last_ckpt": "artifacts/search_l1_d8_ff12/checkpoints/last.pt"
+}
