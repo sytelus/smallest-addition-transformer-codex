@@ -65,23 +65,6 @@ class GPTAdder(nn.Module):
         self.lm_head.weight = self.wte.weight
 
         # Total Parameters = 8 + 16 + 22 + 0 = EXACTLY 46 Parameters!
-        self._init_geometry()
-
-    def _init_geometry(self):
-        with torch.no_grad():
-            # Initialize vectors exactly on a circle of radius 10 to lock routing mathematics
-            for i in range(4):
-                angle = i * 2 * math.pi / 4
-                self.wte.weight[i, 0] = math.cos(angle) * 10.0
-                self.wte.weight[i, 1] = math.sin(angle) * 10.0
-
-            # Initialize Attention mapping transparently
-            self.attn.in_proj_weight.copy_(torch.tensor([
-                [1., 0.], [0., 1.], # Query
-                [1., 0.], [0., 1.], # Key
-                [1., 0.], [0., 1.]  # Value
-            ]))
-            self.attn.out_proj.weight.copy_(torch.eye(2))
 
     def apply_rope(self, x):
         """Standard relative positional encoding application. Zero parameters used."""
@@ -109,10 +92,23 @@ class GPTAdder(nn.Module):
         return self.lm_head(x)
 
 # ==========================================
-# 3. WEIGHTS OPTIMIZATION
+# 3. WEIGHTS computation
 # ==========================================
-def derive_mlp_logic(model):
+def compute_weights(model):
     """Instantly solves the MLP constraints natively in PyTorch."""
+    with torch.no_grad():
+        for i in range(4):
+            angle = i * 2 * math.pi / 4
+            model.wte.weight[i, 0] = math.cos(angle) * 10.0
+            model.wte.weight[i, 1] = math.sin(angle) * 10.0
+
+        model.attn.in_proj_weight.copy_(torch.tensor([
+            [1., 0.], [0., 1.],
+            [1., 0.], [0., 1.],
+            [1., 0.], [0., 1.]
+        ]))
+        model.attn.out_proj.weight.copy_(torch.eye(2))
+
     optimizer = torch.optim.Adam(model.mlp.parameters(), lr=0.01)
 
     # Exhaustive 16-State Truth Table
@@ -167,7 +163,7 @@ def generate(model, tokenizer, strings):
 # ==========================================
 if __name__ == "__main__":
     model = GPTAdder()
-    derive_mlp_logic(model)
+    compute_weights(model)
     tokenizer = AdderTokenizer()
 
     print(f"Total Standard Parameter Count: {sum(p.numel() for p in model.parameters())}\n")
