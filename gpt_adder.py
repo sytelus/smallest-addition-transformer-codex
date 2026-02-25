@@ -17,6 +17,10 @@ Key points:
 - Inference is standard autoregressive generation (`argmax` over next token).
 """
 
+WIDTH = 35
+PROMPT_LEN = WIDTH + 1
+GEN_LEN = WIDTH
+
 
 # ==========================================
 # 1. TOKENIZER (binary pair encoding)
@@ -24,8 +28,8 @@ Key points:
 class AdderTokenizer:
     """Encode A+B prompt into 35 bit-pair tokens + one start-state token."""
 
-    prompt_len = 36
-    gen_len = 35
+    prompt_len = PROMPT_LEN
+    gen_len = GEN_LEN
 
     @staticmethod
     def parse_prompt(prompt: str) -> Tuple[int, int]:
@@ -42,8 +46,8 @@ class AdderTokenizer:
         batch = []
         for s in strings:
             a, b = self.parse_prompt(s)
-            a_bin = bin(a)[2:].zfill(35)[::-1]  # LSB first
-            b_bin = bin(b)[2:].zfill(35)[::-1]  # LSB first
+            a_bin = bin(a)[2:].zfill(WIDTH)[::-1]  # LSB first
+            b_bin = bin(b)[2:].zfill(WIDTH)[::-1]  # LSB first
 
             # Token in {0,1,2,3} encodes one bit pair (a_i, b_i): 2*a_i + b_i
             seq = [int(x) * 2 + int(y) for x, y in zip(a_bin, b_bin)]
@@ -59,7 +63,7 @@ class AdderTokenizer:
         """Decode generated state tokens into 11-digit decimal strings."""
         answers = []
         for seq in token_ids:
-            gen_tokens = seq[36:]  # generated 35 state tokens
+            gen_tokens = seq[PROMPT_LEN:]  # generated state tokens
             bits = [str(int(t.item()) % 2) for t in gen_tokens]  # sum bits
             val = int("".join(bits[::-1]), 2)  # back to MSB-first
             answers.append(f"{val:011d}")
@@ -85,31 +89,14 @@ class GPTAdder(nn.Module):
         # tied head (0 extra params)
         self.lm_head = nn.Linear(2, 4, bias=False)
         self.lm_head.weight = self.wte.weight
-
-    @staticmethod
-    def build_transition_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-        """Sparse causal routing mask.
-
-        For each position t, allow attention only to:
-        - itself (state memory)
-        - paired input position t-35 (bit-pair token)
-        This yields the recurrence O_{i+1} = f(T_i, O_i).
-
-        Note: True means masked in PyTorch MHA bool masks.
-        """
-        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
-        i = torch.arange(seq_len, device=device)
-        mask[i, i] = False
-        src = i - 35
-        valid = src >= 0
-        mask[i[valid], src[valid]] = False
-        return mask
+        # Generic default: standard causal mask.
+        causal = ~torch.tril(torch.ones(PROMPT_LEN + GEN_LEN - 1, PROMPT_LEN + GEN_LEN - 1, dtype=torch.bool))
+        self.register_buffer("attn_mask", causal, persistent=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.wte(input_ids)
         seq_len = x.size(1)
-        attn_mask = self.build_transition_mask(seq_len, x.device)
-        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask, need_weights=False)
+        attn_out, _ = self.attn(x, x, x, attn_mask=self.attn_mask[:seq_len, :seq_len], need_weights=False)
         x = x + attn_out
         x = x + self.mlp(x)
         return self.lm_head(x)
@@ -130,12 +117,28 @@ def build_transition_supervision() -> Tuple[torch.Tensor, torch.Tensor]:
                     o = s + 2 * c         # current state token
                     y = (a + b + c) % 2 + 2 * ((a + b + c) // 2)  # next state
 
-                    x = torch.zeros(36, dtype=torch.long)
+                    x = torch.zeros(PROMPT_LEN, dtype=torch.long)
                     x[0] = t
-                    x[35] = o
+                    x[WIDTH] = o
                     contexts.append(x)
                     targets.append(y)
     return torch.stack(contexts), torch.tensor(targets, dtype=torch.long)
+
+
+def program_transition_attention_mask(model: GPTAdder) -> None:
+    """Program routing mask outside the model code.
+
+    This keeps model/generation generic while allowing task-specific weight
+    programming in this function.
+    """
+    with torch.no_grad():
+        m = torch.ones_like(model.attn_mask, dtype=torch.bool)
+        i = torch.arange(m.size(0), device=m.device)
+        m[i, i] = False
+        src = i - WIDTH
+        valid = src >= 0
+        m[i[valid], src[valid]] = False
+        model.attn_mask.copy_(m)
 
 
 def transition_table_accuracy(model: GPTAdder, contexts: torch.Tensor, targets: torch.Tensor) -> float:
@@ -154,10 +157,12 @@ def compute_weights(model: GPTAdder, max_restarts: int = 8, max_steps: int = 300
     contexts, targets = build_transition_supervision()
     best_acc = -1.0
     best_state = None
+    program_transition_attention_mask(model)
 
     for seed in range(1, max_restarts + 1):
         torch.manual_seed(seed)
         fresh = GPTAdder()
+        program_transition_attention_mask(fresh)
         model.load_state_dict(fresh.state_dict())
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
