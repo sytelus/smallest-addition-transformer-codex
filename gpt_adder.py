@@ -1,206 +1,295 @@
+import math
+import random
+from typing import List, Sequence, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
-import math
 
 """
-Here is the PyTorch GPT-style decoder implementation that achieves flawless 10-digit addition using exactly 46 standard trainable parameters.
+Minimal GPT-style decoder-only adder (<50 params, no checkpoint).
 
-It uses,
-
-Standard nn.Embedding Layer: It exclusively uses standard nn.Embedding(4, 2) mapped into a completely standard Causal Decoder setup. No custom get_embed code is used.
-Standard Autoregressive Generator: The generate() loop behaves strictly like HuggingFace Transformers. It feeds the input_ids, calls the model to get logits, calls argmax() on the final token, and folds the ID back into the sequence context loop. It handles zero addition logic manually.
-
-The Strategy (46 Parameters):
-
-Base-2 Encoding: Standard string addition requires base-10, which necessitates enormous vocabularies. The Tokenizer maps the 10-digit input to 35-bit binary strings and interleaves the bit-pairs into Token IDs [0, 1, 2, 3].
-Standard RoPE (0 Params): We apply standard 2D Rotary Positional Embeddings with a frequency period of 35.0. At any causal generation step, the current output token and its necessary target input token are perfectly aligned by exactly $35$ steps! RoPE completely naturally rotates the Query and Key to yield a maximal attention dot-product at exactly distance 35 and 0.
-Geometry Routing (16 Params): By initializing the token embeddings on a geometric circle and utilizing standard MultiheadAttention, the model inherently averages the input pair values with the residual carry, feeding a geometrically unique 2D coordinate for all 16 logic states into the MLP.
-Boolean Logic MLP (22 Params): A tiny 4-neuron MLP natively morphs the 2D coordinate to point exactly at the correct output token token in the tied Language Modeling head.
+Key points:
+- Model remains tiny (46 trainable parameters).
+- No conventional training loop over large datasets/checkpoints.
+- We solve weights using a tiny optimization over the 16 full-adder transition
+  states in `compute_weights()`.
+- Inference is standard autoregressive generation (`argmax` over next token).
 """
 
 
 # ==========================================
-# 1. THE TOKENIZER
+# 1. TOKENIZER (binary pair encoding)
 # ==========================================
 class AdderTokenizer:
-    def encode(self, strings):
+    """Encode A+B prompt into 35 bit-pair tokens + one start-state token."""
+
+    prompt_len = 36
+    gen_len = 35
+
+    @staticmethod
+    def parse_prompt(prompt: str) -> Tuple[int, int]:
+        if not prompt.endswith("=") or "+" not in prompt:
+            raise ValueError(f"Invalid prompt format: {prompt!r}")
+        a_str, b_str = prompt[:-1].split("+")
+        a = int(a_str)
+        b = int(b_str)
+        if not (0 <= a <= 9_999_999_999 and 0 <= b <= 9_999_999_999):
+            raise ValueError("Operands must be in [0, 9_999_999_999]")
+        return a, b
+
+    def encode(self, strings: Sequence[str]) -> torch.Tensor:
         batch = []
         for s in strings:
-            a_str, b_str = s.replace("=", "").split("+")
-            # Convert inputs to 35-bit binary arrays (Least Significant Bit first)
-            a_bin = bin(int(a_str))[2:].zfill(35)[::-1]
-            b_bin = bin(int(b_str))[2:].zfill(35)[::-1]
+            a, b = self.parse_prompt(s)
+            a_bin = bin(a)[2:].zfill(35)[::-1]  # LSB first
+            b_bin = bin(b)[2:].zfill(35)[::-1]  # LSB first
 
-            seq = []
-            for a, b in zip(a_bin, b_bin):
-                # Map pairs strictly into overlapping dictionary space: 0, 1, 2, 3
-                seq.append(int(a) * 2 + int(b))
+            # Token in {0,1,2,3} encodes one bit pair (a_i, b_i): 2*a_i + b_i
+            seq = [int(x) * 2 + int(y) for x, y in zip(a_bin, b_bin)]
 
-            # Token 0 perfectly mimics the "Sum=0, Carry=0" state for the initial gap
+            # Initial state token O0 = 0 (sum_bit=0, carry=0).
             seq.append(0)
             batch.append(seq)
+
         return torch.tensor(batch, dtype=torch.long)
 
-    def decode(self, token_ids):
+    @staticmethod
+    def decode(token_ids: torch.Tensor) -> List[str]:
+        """Decode generated state tokens into 11-digit decimal strings."""
         answers = []
         for seq in token_ids:
-            # Slices off the 36 prompt tokens to isolate strictly generated tokens
-            gen_tokens = seq[36:]
-
-            # Extract standard Sum state
-            bits = [str(t.item() % 2) for t in gen_tokens]
-
-            # Reconstruct binary string (MSB first) and convert to base-10 decimal
-            bin_str = "".join(bits[::-1])
-            decimal_val = int(bin_str, 2)
-            answers.append(str(decimal_val).zfill(11))
+            gen_tokens = seq[36:]  # generated 35 state tokens
+            bits = [str(int(t.item()) % 2) for t in gen_tokens]  # sum bits
+            val = int("".join(bits[::-1]), 2)  # back to MSB-first
+            answers.append(f"{val:011d}")
         return answers
 
+
 # ==========================================
-# 2. GPT DECODER-ONLY TRANSFORMER (46 Params)
+# 2. GPT-STYLE DECODER-ONLY MODEL (46 params)
 # ==========================================
 class GPTAdder(nn.Module):
     def __init__(self):
         super().__init__()
-        # 1. Standard Token Embedding (Vocab=4, d_model=2) -> 8 Params
+        # 8 params
         self.wte = nn.Embedding(4, 2)
-
-        # 2. Causal Multi-Head Attention (d_model=2, heads=1, bias=False) -> 16 Params
+        # 16 params (bias=False keeps it minimal)
         self.attn = nn.MultiheadAttention(embed_dim=2, num_heads=1, bias=False, batch_first=True)
-
-        # 3. Standard MLP Block -> 22 Params
+        # 22 params
         self.mlp = nn.Sequential(
             nn.Linear(2, 4, bias=True),
             nn.ReLU(),
-            nn.Linear(4, 2, bias=True)
+            nn.Linear(4, 2, bias=True),
         )
-
-        # 4. Tied Language Modeling Head -> 0 Params
+        # tied head (0 extra params)
         self.lm_head = nn.Linear(2, 4, bias=False)
         self.lm_head.weight = self.wte.weight
 
-        # Total Parameters = 8 + 16 + 22 + 0 = EXACTLY 46 Parameters!
+    @staticmethod
+    def build_transition_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+        """Sparse causal routing mask.
 
-    def apply_rope(self, x):
-        """Standard relative positional encoding application. Zero parameters used."""
-        seq_len = x.size(1)
-        pos = torch.arange(seq_len, device=x.device, dtype=torch.float32).unsqueeze(1)
-        freqs = pos * (2 * math.pi / 35.0)
-        x_rot = torch.empty_like(x)
-        x_rot[..., 0] = x[..., 0] * torch.cos(freqs) - x[..., 1] * torch.sin(freqs)
-        x_rot[..., 1] = x[..., 0] * torch.sin(freqs) + x[..., 1] * torch.cos(freqs)
-        return x_rot
+        For each position t, allow attention only to:
+        - itself (state memory)
+        - paired input position t-35 (bit-pair token)
+        This yields the recurrence O_{i+1} = f(T_i, O_i).
 
-    def forward(self, input_ids):
-        """100% Standard Causal Decoder Forward Pass."""
+        Note: True means masked in PyTorch MHA bool masks.
+        """
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+        i = torch.arange(seq_len, device=device)
+        mask[i, i] = False
+        src = i - 35
+        valid = src >= 0
+        mask[i[valid], src[valid]] = False
+        return mask
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.wte(input_ids)
-        x_rot = self.apply_rope(x)
-
         seq_len = x.size(1)
-        causal_mask = ~torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device).tril()
-
-        # RoPE applies exclusively to queries/keys to route; Value preserves the token vectors natively
-        attn_out, _ = self.attn(x_rot, x_rot, x, attn_mask=causal_mask, need_weights=False)
+        attn_mask = self.build_transition_mask(seq_len, x.device)
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask, need_weights=False)
         x = x + attn_out
         x = x + self.mlp(x)
-
         return self.lm_head(x)
 
+
 # ==========================================
-# 3. WEIGHTS computation
+# 3. WEIGHT SOLVER (tiny optimization, no ckpt)
 # ==========================================
-def compute_weights(model):
-    """Instantly solves the MLP constraints natively in PyTorch."""
-    with torch.no_grad():
-        for i in range(4):
-            angle = i * 2 * math.pi / 4
-            model.wte.weight[i, 0] = math.cos(angle) * 10.0
-            model.wte.weight[i, 1] = math.sin(angle) * 10.0
-
-        model.attn.in_proj_weight.copy_(torch.tensor([
-            [1., 0.], [0., 1.],
-            [1., 0.], [0., 1.],
-            [1., 0.], [0., 1.]
-        ]))
-        model.attn.out_proj.weight.copy_(torch.eye(2))
-
-    optimizer = torch.optim.Adam(model.mlp.parameters(), lr=0.01)
-
-    # Exhaustive 16-State Truth Table
-    T, O, Y = [], [], []
+def build_transition_supervision() -> Tuple[torch.Tensor, torch.Tensor]:
+    """16 full-adder transitions (T,O)->Y as tiny supervised set."""
+    contexts = []
+    targets = []
     for a in [0, 1]:
         for b in [0, 1]:
             for s in [0, 1]:
                 for c in [0, 1]:
-                    T.append(a * 2 + b)
-                    O.append(s + 2 * c)
-                    Y.append((a + b + c) % 2 + 2 * ((a + b + c) // 2))
+                    t = a * 2 + b         # pair token
+                    o = s + 2 * c         # current state token
+                    y = (a + b + c) % 2 + 2 * ((a + b + c) // 2)  # next state
 
-    T_tensor = torch.tensor(T, dtype=torch.long)
-    O_tensor = torch.tensor(O, dtype=torch.long)
-    Y_tensor = torch.tensor(Y, dtype=torch.long)
+                    x = torch.zeros(36, dtype=torch.long)
+                    x[0] = t
+                    x[35] = o
+                    contexts.append(x)
+                    targets.append(y)
+    return torch.stack(contexts), torch.tensor(targets, dtype=torch.long)
 
-    W = model.wte.weight
 
-    for _ in range(5000):
-        # Attention geometrically averages inputs. Simulating it instantly:
-        X_out = 0.5 * W[T_tensor] + 1.5 * W[O_tensor]
+def transition_table_accuracy(model: GPTAdder, contexts: torch.Tensor, targets: torch.Tensor) -> float:
+    with torch.no_grad():
+        logits = model(contexts)[:, -1, :]
+        pred = logits.argmax(dim=-1)
+        return float((pred == targets).float().mean().item())
 
-        X_final = X_out + model.mlp(X_out)
-        logits = F.linear(X_final, W)
 
-        loss = F.cross_entropy(logits, Y_tensor)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+def compute_weights(model: GPTAdder, max_restarts: int = 8, max_steps: int = 3000, lr: float = 5e-3) -> None:
+    """Solve the tiny model by optimization on 16 transitions.
 
-        if loss.item() < 1e-4:
-            break
+    This is not conventional training on large datasets. It is a direct
+    parameter solve over the exact full-adder truth table.
+    """
+    contexts, targets = build_transition_supervision()
+    best_acc = -1.0
+    best_state = None
+
+    for seed in range(1, max_restarts + 1):
+        torch.manual_seed(seed)
+        fresh = GPTAdder()
+        model.load_state_dict(fresh.state_dict())
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        for _ in range(max_steps):
+            logits = model(contexts)[:, -1, :]
+            loss = F.cross_entropy(logits, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                if bool((logits.argmax(dim=-1) == targets).all()):
+                    print(f"Solved transition table exactly with seed={seed}")
+                    return
+
+        acc = transition_table_accuracy(model, contexts, targets)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    raise RuntimeError(f"Could not solve transitions exactly. Best transition accuracy: {best_acc:.4f}")
+
 
 # ==========================================
-# 4. STRICTLY STANDARD GENERATOR
+# 4. AUTOREGRESSIVE GENERATION
 # ==========================================
-def generate(model, tokenizer, strings):
-    """100% unstructured standard text generation loop."""
+def generate(model: GPTAdder, tokenizer: AdderTokenizer, strings: Sequence[str]) -> List[str]:
     input_ids = tokenizer.encode(strings)
-
     model.eval()
     with torch.no_grad():
-        for _ in range(35):
+        for _ in range(tokenizer.gen_len):
             logits = model(input_ids)
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
-
     return tokenizer.decode(input_ids)
 
+
 # ==========================================
-# 5. EXECUTION & ACCURACY TESTING
+# 5. DEBUG / EVAL
+# ==========================================
+def expected_states(a: int, b: int) -> List[int]:
+    out = []
+    carry = 0
+    for i in range(35):
+        abit = (a >> i) & 1
+        bbit = (b >> i) & 1
+        s = abit + bbit + carry
+        sum_bit = s & 1
+        carry = s >> 1
+        out.append(sum_bit + 2 * carry)
+    return out
+
+
+def debug_one(model: GPTAdder, tokenizer: AdderTokenizer, prompt: str) -> None:
+    a, b = tokenizer.parse_prompt(prompt)
+    expected = f"{a + b:011d}"
+    ids = tokenizer.encode([prompt])
+    trace = []
+    model.eval()
+    with torch.no_grad():
+        for _ in range(tokenizer.gen_len):
+            logits = model(ids)
+            nxt = int(logits[0, -1, :].argmax().item())
+            trace.append(nxt)
+            ids = torch.cat([ids, torch.tensor([[nxt]], dtype=torch.long)], dim=1)
+    pred = tokenizer.decode(ids)[0]
+    exp_trace = expected_states(a, b)
+    print("Failure debug:")
+    print(f"prompt={prompt}")
+    print(f"pred={pred} expected={expected}")
+    print(f"generated_states_first12={trace[:12]}")
+    print(f"expected_states_first12={exp_trace[:12]}")
+    print(f"generated_sum_bits_first12={[t % 2 for t in trace[:12]]}")
+    print(f"expected_sum_bits_first12={[t % 2 for t in exp_trace[:12]]}")
+
+
+def make_prompts(n: int, seed: int = 42) -> List[str]:
+    random.seed(seed)
+    out = []
+    for _ in range(n):
+        a = random.randint(0, 9_999_999_999)
+        b = random.randint(0, 9_999_999_999)
+        out.append(f"{a:010d}+{b:010d}=")
+    return out
+
+
+def run_stage(model: GPTAdder, tokenizer: AdderTokenizer, prompts: Sequence[str], n: int) -> bool:
+    subset = list(prompts[:n])
+    pred = generate(model, tokenizer, subset)
+    exp = [f"{tokenizer.parse_prompt(p)[0] + tokenizer.parse_prompt(p)[1]:011d}" for p in subset]
+    correct = sum(int(p == e) for p, e in zip(pred, exp))
+
+    print("====================================")
+    print(f"Stage {n}: {correct}/{n} correct")
+    print("====================================")
+    for i in range(min(n, 3)):
+        print(f"Prompt : {subset[i]}")
+        print(f"Output : {pred[i]}")
+        print(f"Math   : {exp[i]}\n")
+
+    if correct != n:
+        first_bad = next(i for i, (p, e) in enumerate(zip(pred, exp)) if p != e)
+        debug_one(model, tokenizer, subset[first_bad])
+        return False
+    return True
+
+
+# ==========================================
+# 6. MAIN
 # ==========================================
 if __name__ == "__main__":
     model = GPTAdder()
     compute_weights(model)
     tokenizer = AdderTokenizer()
 
-    print(f"Total Standard Parameter Count: {sum(p.numel() for p in model.parameters())}\n")
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Total Standard Parameter Count: {param_count}\n")
 
-    random.seed(42)
-    test_batch, expected_batch = [], []
-    for _ in range(100):
-        n1 = random.randint(0, 9999999999)
-        n2 = random.randint(0, 9999999999)
-        test_batch.append(f"{n1:010d}+{n2:010d}=")
-        expected_batch.append(f"{n1 + n2:011d}")
+    prompts = make_prompts(100, seed=42)
 
-    model_answers = generate(model, tokenizer, test_batch)
+    # Requested progression
+    if not run_stage(model, tokenizer, prompts, 1):
+        raise SystemExit(1)
+    if not run_stage(model, tokenizer, prompts, 2):
+        raise SystemExit(1)
+    if not run_stage(model, tokenizer, prompts, 3):
+        raise SystemExit(1)
 
-    correct = sum(1 for e, m in zip(expected_batch, model_answers) if e == m)
-    for i in range(3):
-        print(f"Prompt : {test_batch[i]}")
-        print(f"Output : {model_answers[i]}")
-        print(f"Math   : {expected_batch[i]}\n")
-
-    print("====================================")
-    print(f"Final Auto-Generation Accuracy: {correct}% ({correct}/100)")
-    print("====================================")
+    # Extended checks
+    ok10 = run_stage(model, tokenizer, prompts, 10)
+    ok100 = run_stage(model, tokenizer, prompts, 100)
+    if ok10 and ok100:
+        print("All stages passed: 1, 2, 3, 10, 100.")
